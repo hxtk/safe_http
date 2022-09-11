@@ -1,45 +1,25 @@
 #![feature(buf_read_has_data_left)]
 #![feature(string_remove_matches)]
+#![feature(assert_matches)]
 
+mod uri;
+
+#[cfg(test)]
+mod tests;
+
+use uri::Uri;
 use rayon;
 use std::boxed::Box;
 use std::cmp;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener};
 use std::result::Result;
 use std::thread;
 use std::time::Duration;
 use std::vec::Vec;
 
-#[cfg(test)]
-mod tests {
-    use std::io::BufReader;
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-
-    #[test]
-    fn read_request() {
-        let req_str: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
-        let mut br = BufReader::new(req_str);
-        let res = super::read_request(&mut br);
-        println!("{:#?}", res);
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn read_consecutive_request() {
-        let req_str: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
-        let mut stream = BufReader::new(req_str);
-        let _ = super::read_request(&mut stream);
-        let res = super::read_request(&mut stream);
-        println!("{:#?}", res);
-        assert!(res.is_ok());
-    }
-}
 
 pub enum Method {
     Options,
@@ -56,15 +36,15 @@ pub enum Method {
 impl std::convert::From<&str> for Method {
     fn from(s: &str) -> Self {
         match s {
-            "OPTIONS" => Method::Options,
-            "GET" => Method::Get,
-            "HEAD" => Method::Head,
-            "POST" => Method::Post,
-            "PUT" => Method::Put,
-            "DELETE" => Method::Delete,
-            "TRACE" => Method::Trace,
-            "CONNECT" => Method::Connect,
-            s => Method::Extension(String::from(s)),
+            "OPTIONS" => Self::Options,
+            "GET" => Self::Get,
+            "HEAD" => Self::Head,
+            "POST" => Self::Post,
+            "PUT" => Self::Put,
+            "DELETE" => Self::Delete,
+            "TRACE" => Self::Trace,
+            "CONNECT" => Self::Connect,
+            s => Self::Extension(String::from(s)),
         }
     }
 }
@@ -85,7 +65,7 @@ impl Headers {
             Some(v) => v.push(value),
             None => {
                 self.hs.insert(key, vec![value]);
-            }
+            },
         }
     }
 
@@ -99,7 +79,7 @@ impl Headers {
             },
             None => {
                 self.hs.insert(key, vec![value]);
-            }
+            },
         }
     }
 
@@ -109,10 +89,113 @@ impl Headers {
 
     fn get(&self, key: &str) -> Option<&str> {
         if let Some(v) = self.hs.get(key) {
-            Some(&v[0])
+            match v.get(0) {
+                Some(x) => Some(&x),
+                None => None,
+            }
         } else {
             None
         }
+    }
+
+    fn get_vec(&self, key: &str) -> Option<&Vec<String>> {
+        if let Some(v) = self.hs.get(key) {
+            Some(&v)
+        } else {
+            None
+        }
+    }
+}
+
+static GENERAL_HDRS: [&str; 9] = [
+    "Cache-Control",
+    "Connection",
+    "Date",
+    "Pragma",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
+    "Via",
+    "Warning",
+];
+
+static REQUEST_HDRS: [&str; 19] = [
+    "Accept",
+    "Accept-Charset",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Authorization",
+    "Expect",
+    "From",
+    "Host",
+    "If-Match",
+    "If-Modified-Since",
+    "If-None-Match",
+    "If-Range",
+    "If-Unmodified-Since",
+    "Max-Forwards",
+    "Proxy-Authorization",
+    "Range",
+    "Referer",
+    "TE",
+    "User-Agent",
+];
+
+static ENTITY_HDRS: [&str; 9] = [
+    "Allow",
+    "Content-Encoding",
+    "Content-Language",
+    "Content-Length",
+    "Content-MD5",
+    "Content-Range",
+    "Content-Type",
+    "Expires",
+    "Last-Modified",
+];
+
+impl std::convert::Into<Vec<u8>> for Headers {
+    fn into(mut self) -> Vec<u8> {
+        let mut res = String::new();
+        for k in GENERAL_HDRS {
+            if let Some(v) = self.hs.remove(k) {
+                v.iter().for_each(|x| {
+                    res.push_str(&k);
+                    res.push_str(": ");
+                    res.push_str(x);
+                    res.push_str("\r\n");
+                });
+            }
+        }
+        for k in REQUEST_HDRS {
+            if let Some(v) = self.hs.remove(k) {
+                v.iter().for_each(|x| {
+                    res.push_str(&k);
+                    res.push_str(": ");
+                    res.push_str(x);
+                    res.push_str("\r\n");
+                });
+            }
+        }
+        for k in ENTITY_HDRS {
+            if let Some(v) = self.hs.remove(k) {
+                v.iter().for_each(|x| {
+                    res.push_str(&k);
+                    res.push_str(": ");
+                    res.push_str(x);
+                    res.push_str("\r\n");
+                });
+            }
+        }
+        for (k, v) in self.hs {
+            v.iter().for_each(|x| {
+                res.push_str(&k);
+                res.push_str(": ");
+                res.push_str(x);
+                res.push_str("\r\n");
+            });
+        }
+
+        res.into_bytes()
     }
 }
 
