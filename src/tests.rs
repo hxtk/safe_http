@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use super::LimitedReader;
 use std::io::BufReader;
 
 #[test]
@@ -16,8 +16,8 @@ fn normalize_header_value_with_crlf() {
 fn read_request() {
     let req_str: &[u8] =
         b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
-    let mut br = BufReader::new(req_str);
-    let res = super::read_request(&mut br);
+    let mut br = BufReader::new(LimitedReader::new(req_str, None));
+    let res = super::read_request(&mut br, 1 << 20);
     println!("{:#?}", res);
     assert!(res.is_ok());
 }
@@ -25,9 +25,9 @@ fn read_request() {
 #[test]
 fn read_consecutive_request() {
     let req_str: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\nGET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
-    let mut stream = BufReader::new(req_str);
-    let _ = super::read_request(&mut stream);
-    let res = super::read_request(&mut stream);
+    let mut stream = BufReader::new(LimitedReader::new(req_str, None));
+    let _ = super::read_request(&mut stream, 1 << 20);
+    let res = super::read_request(&mut stream, 1 << 20);
     println!("{:#?}", res);
     assert!(res.is_ok());
 }

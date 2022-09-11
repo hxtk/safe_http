@@ -7,7 +7,6 @@ mod uri;
 #[cfg(test)]
 mod tests;
 
-use rayon;
 use std::boxed::Box;
 use std::cmp;
 use std::collections::HashMap;
@@ -20,6 +19,7 @@ use std::time::Duration;
 use std::vec::Vec;
 use uri::Uri;
 
+#[derive(Debug)]
 pub enum Method {
     Options,
     Get,
@@ -248,7 +248,7 @@ impl<T: Handler + Send + Sync> Server<T> {
 
     pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
         let mut backoff = Duration::from_millis(0);
-        rayon::scope(|s| {
+        thread::scope(|s| {
             for stream in l.incoming() {
                 if let Err(_) = stream {
                     backoff = if backoff.is_zero() {
@@ -259,25 +259,26 @@ impl<T: Handler + Send + Sync> Server<T> {
                     thread::sleep(backoff);
                     continue;
                 }
-                // Unwrap is safe because we caught the error above.
-                let mut stream = stream.unwrap();
 
+                // Unwrap is safe because we caught the error above.
+                let stream = stream.unwrap();
                 backoff = Duration::from_millis(0);
-                s.spawn(move |_| {
+                s.spawn(move || {
+                    let mut w = stream.try_clone().unwrap();
+                    let mut br = BufReader::new(LimitedReader::new(&stream, None));
                     loop {
-                        let mut br = BufReader::new(LimitedReader::new(&stream, Some(self.max_header_bytes)));
                         match br.has_data_left() {
                             Ok(true) => (),
                             _ => {
                                 break;
                             },
                         }
-                        match read_request(&mut br) {
+                        match read_request(&mut br, self.max_header_bytes) {
                             Ok(req) => {
-                        stream.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
+                        w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
                             },
                             Err(e) => {
-                                stream.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
+                                w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
                                 println!("{}", e);
                                 break;
                             }
@@ -329,16 +330,20 @@ impl<R: Read> Read for LimitedReader<R> {
     }
 }
 
-fn read_request<R: BufRead>(mut br: R) -> Result<Response, Box<dyn Error>> {
+fn read_request<R: Read>(
+    br: &mut BufReader<LimitedReader<R>>,
+    limit: usize,
+) -> Result<Response, Box<dyn Error>> {
     let mut buf = String::new();
+    br.get_mut().set_limit(limit);
     br.read_line(&mut buf)?;
     buf.remove_matches("\r\n");
 
     let (method, uri, version) = parse_request_line(&buf)?;
-
     let mut headers = Headers::new();
     loop {
         buf.clear();
+        br.get_mut().set_limit(limit);
         br.read_line(&mut buf)?;
         buf.remove_matches("\r\n");
         if buf == "" {
@@ -352,6 +357,7 @@ fn read_request<R: BufRead>(mut br: R) -> Result<Response, Box<dyn Error>> {
             Err("malformed header: ".to_owned() + &buf)
         }?;
     }
+    br.get_mut().unset_limit();
 
     Ok(Response {})
 }
