@@ -1,0 +1,18 @@
+[package]
+name = "safe_http"
+version = "0.1.0"
+authors = ["Peter <peter@psanders.me>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "http"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.5.3"
+tightness = "1.0.1"
