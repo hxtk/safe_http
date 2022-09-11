@@ -7,19 +7,18 @@ mod uri;
 #[cfg(test)]
 mod tests;
 
-use uri::Uri;
 use rayon;
 use std::boxed::Box;
 use std::cmp;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener};
+use std::net::TcpListener;
 use std::result::Result;
 use std::thread;
 use std::time::Duration;
 use std::vec::Vec;
-
+use uri::Uri;
 
 pub enum Method {
     Options,
@@ -65,7 +64,7 @@ impl Headers {
             Some(v) => v.push(value),
             None => {
                 self.hs.insert(key, vec![value]);
-            },
+            }
         }
     }
 
@@ -76,10 +75,10 @@ impl Headers {
             Some(v) => {
                 v.clear();
                 v.push(value);
-            },
+            }
             None => {
                 self.hs.insert(key, vec![value]);
-            },
+            }
         }
     }
 
@@ -222,8 +221,7 @@ pub struct Request {
 }
 
 #[derive(Debug)]
-pub struct Response {
-}
+pub struct Response {}
 
 pub trait Handler {
     fn serve_http(&self, r: Request) -> Response;
@@ -344,7 +342,7 @@ fn read_request<R: BufRead>(mut br: R) -> Result<Response, Box<dyn Error>> {
         br.read_line(&mut buf)?;
         buf.remove_matches("\r\n");
         if buf == "" {
-            break
+            break;
         }
 
         if let Some((key, value)) = buf.split_once(":") {

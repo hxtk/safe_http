@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests;
 
-use std::boxed::Box;
-use std::result::Result;
-use std::collections::BTreeMap;
-use std::vec::Vec;
-use std::num::NonZeroU32;
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
+use std::boxed::Box;
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
+use std::result::Result;
+use std::vec::Vec;
 use tightness::bound;
 
 pub enum UriRef {
@@ -40,7 +40,9 @@ impl std::convert::TryFrom<&str> for Uri {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        let (scheme, remain) = s.split_once(':').ok_or("uri must contain at least one ':'")?;
+        let (scheme, remain) = s
+            .split_once(':')
+            .ok_or("uri must contain at least one ':'")?;
         let scheme = Scheme::new(scheme.to_string())?;
 
         let (hier_part, remain) = if let Some(idx) = remain.find('?') {
@@ -63,10 +65,10 @@ impl std::convert::TryFrom<&str> for Uri {
             };
 
             let (host, port) = if let Some(idx) = host.find(']') {
-                if idx+1 == host.len() {
+                if idx + 1 == host.len() {
                     (host.to_owned(), None)
                 } else {
-                    let (h, p) = host.split_at(idx+1);
+                    let (h, p) = host.split_at(idx + 1);
                     let p = u32::from_str_radix(p, 10)?;
                     match NonZeroU32::new(p) {
                         Some(nzp) => Ok((h.to_owned(), Some(nzp))),
@@ -86,16 +88,20 @@ impl std::convert::TryFrom<&str> for Uri {
                             Some(nzp) => Ok((h, Some(nzp))),
                             None => Err("port must be nonzero if specified"),
                         },
-                    }).unwrap_or(Ok((host.to_owned(), None)))?
+                    })
+                    .unwrap_or(Ok((host.to_owned(), None)))?
             };
 
             let path = AbEmpty::new((*path).to_string())?;
 
-            HierPart::AbEmpty(Authority{
-                user_info: user_info,
-                host: host,
-                port: port,
-            }, path)
+            HierPart::AbEmpty(
+                Authority {
+                    user_info: user_info,
+                    host: host,
+                    port: port,
+                },
+                path,
+            )
         } else if hier_part.is_empty() {
             HierPart::Empty
         } else if hier_part.starts_with('/') {
@@ -112,7 +118,7 @@ impl std::convert::TryFrom<&str> for Uri {
             } else {
                 (&remain[1..], "")
             };
-            
+
             let mut query = Query::new();
             for x in qs.split('&') {
                 match x.split_once('=') {
@@ -125,14 +131,14 @@ impl std::convert::TryFrom<&str> for Uri {
         };
 
         if remain.starts_with('#') {
-            Ok(Uri{
+            Ok(Uri {
                 scheme: scheme,
                 hier_part: hier_part,
                 query: query,
                 fragment: Some(remain[1..].to_string()),
             })
         } else {
-            Ok(Uri{
+            Ok(Uri {
                 scheme: scheme,
                 hier_part: hier_part,
                 query: query,
@@ -241,7 +247,9 @@ struct Query {
 
 impl Query {
     fn new() -> Query {
-        Query { qs: BTreeMap::new() }
+        Query {
+            qs: BTreeMap::new(),
+        }
     }
 
     fn add(&mut self, key: &str, value: Option<&str>) {
@@ -251,7 +259,7 @@ impl Query {
             Some(v) => v.push(value),
             None => {
                 self.qs.insert(key, vec![value]);
-            },
+            }
         }
     }
 
@@ -262,10 +270,10 @@ impl Query {
             Some(v) => {
                 v.clear();
                 v.push(value);
-            },
+            }
             None => {
                 self.qs.insert(key, vec![value]);
-            },
+            }
         }
     }
 }
@@ -273,15 +281,16 @@ impl Query {
 impl std::string::ToString for Query {
     fn to_string(&self) -> String {
         let mut vs = Vec::<String>::new();
-        self.qs.iter()
-            .for_each(|(k, v)| {
-                v.iter().for_each(|x| {
-                    match x {
-                        Some(x) => {vs.push(k.to_owned() + "=" + x);},
-                        None => {vs.push(k.to_owned());},
-                    }
-                });
+        self.qs.iter().for_each(|(k, v)| {
+            v.iter().for_each(|x| match x {
+                Some(x) => {
+                    vs.push(k.to_owned() + "=" + x);
+                }
+                None => {
+                    vs.push(k.to_owned());
+                }
             });
+        });
         vs.iter().fold(String::new(), |a, x| a + "&" + x)[1..].to_string()
     }
 }

@@ -1,5 +1,5 @@
-use std::io::BufReader;
 use std::convert::TryFrom;
+use std::io::BufReader;
 
 #[test]
 fn it_works() {
@@ -14,7 +14,8 @@ fn normalize_header_value_with_crlf() {
 
 #[test]
 fn read_request() {
-    let req_str: &[u8] = b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
+    let req_str: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";
     let mut br = BufReader::new(req_str);
     let res = super::read_request(&mut br);
     println!("{:#?}", res);
