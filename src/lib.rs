@@ -3,6 +3,7 @@
 #![feature(assert_matches)]
 
 mod uri;
+mod ep;
 
 #[cfg(test)]
 mod tests;
@@ -18,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 use std::vec::Vec;
 use uri::Uri;
+//use ep::Epoll;
 
 #[derive(Debug)]
 pub enum Method {
