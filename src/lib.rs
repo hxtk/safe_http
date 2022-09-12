@@ -1,9 +1,10 @@
 #![feature(buf_read_has_data_left)]
 #![feature(string_remove_matches)]
 #![feature(assert_matches)]
+#![feature(mutex_unpoison)]
 
-mod uri;
 mod ep;
+mod uri;
 
 #[cfg(test)]
 mod tests;
@@ -11,20 +12,20 @@ mod tests;
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::{ BufRead, BufReader, Read, Write };
-use std::net::{ SocketAddr, TcpListener, TcpStream };
-use std::os::unix::io::{ AsRawFd, RawFd };
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::result::Result;
-use std::sync::{ Arc, Weak };
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::thread;
 use std::time::Duration;
 use std::vec::Vec;
 
+use epoll::Events;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
-use epoll::Events;
 
 use ep::Epoll;
 
@@ -347,85 +348,19 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
     }
 
     pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
-        let epfd: Arc<Epoll<Context<TcpStream, TcpStream>>> = Arc::new(Epoll::new(false)?);
+        let lock = Arc::new(Mutex::new(()));
+        let epfd = Arc::new(Epoll::new(false)?);
         let backoff = Arc::new(AtomicU64::new(0));
-
         epfd.add(Context::Listener(l), Events::EPOLLIN)?;
-
-        ThreadPoolBuilder::new().num_threads(self.concurrency).build()?.install(|| {
-            loop {
-                let wait = epfd.wait(None);
-                if let Err(e) = wait {
-                    println!("Error awaiting epoll: {}.", e);
-                    break;
-                }
-                wait.unwrap().into_par_iter().for_each(|(event, ctx)| {
-                    match &mut *ctx.lock().unwrap() {
-                        Context::Ref(_) => {
-                            panic!("Unreachable Context::Ref");
-                        }
-                        Context::Listener(x) => {
-                            match x.accept() {
-                                Err(e) => {
-                                    println!("Error accepting connection: {}.", e);
-                                    backoff_helper(
-                                        Arc::downgrade(&backoff),
-                                        Arc::downgrade(&epfd),
-                                        x.as_raw_fd(),
-                                    );
-                                    return;
-                                },
-                                Ok((s, p)) => {
-                                    backoff.store(0, Ordering::Relaxed);
-                                    let w = match s.try_clone() {
-                                        Ok(x) => x,
-                                        Err(e) => {
-                                            println!("Error accepting connection from {}: {}", p, e);
-                                            backoff_helper(
-                                                Arc::downgrade(&backoff),
-                                                Arc::downgrade(&epfd),
-                                                x.as_raw_fd(),
-                                            );
-                                            return;
-                                        }
-                                    };
-                                    let br = BufReader::new(LimitedReader::new(s, None));
-                                    let c = Conn{
-                                        w: w,
-                                        br: br,
-                                        peer: p,
-                                    };
-
-                                    let res = epfd.add(
-                                        Context::Conn(c),
-                                        Events::EPOLLIN | Events::EPOLLRDHUP,
-                                    );
-
-                                    if let Err(e) = res {
-                                        println!("Error monitoring: {}", e);
-                                    }
-                                }
-                            }
-                        },
-                        Context::Conn(c) => {
-                            if event.contains(Events::EPOLLRDHUP) {
-                                if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
-                                    println!("Error removing closed connection: {}.", e);
-                                }
-                                return;
-                            }
-
-                            match read_request(&mut c.br, self.max_header_bytes) {
-                                Ok(_req) => {
-                                    c.w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
-                                },
-                                Err(e) => {
-                                    c.w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
-                                    println!("{}", e);
-                                },
-                            };
-                        }
-                    };
+        thread::scope(|s| {
+            for _ in 0..self.concurrency {
+                let lock = Arc::clone(&lock);
+                let epfd = Arc::clone(&epfd);
+                let backoff = Arc::clone(&backoff);
+                let header_bytes = self.max_header_bytes;
+                s.spawn(move || {
+                    server_loop(lock, epfd, backoff, header_bytes);
+                    println!("{:?} exited.", thread::current().id());
                 });
             }
         });
@@ -433,7 +368,135 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
     }
 }
 
-fn backoff_helper(bo: Weak<AtomicU64>, epfd: Weak<Epoll<Context<TcpStream, TcpStream>>>, fd: RawFd) {
+fn server_loop(
+    lock: Arc<Mutex<()>>,
+    epfd: Arc<Epoll<Context<TcpStream, TcpStream>>>,
+    backoff: Arc<AtomicU64>,
+    max_header_bytes: usize,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        let wait = {
+            let _guard = lock.lock().unwrap_or_else(|mut e| {
+                lock.clear_poison();
+                e.into_inner()
+            });
+
+            epfd.wait(None)
+        };
+
+        if let Err(e) = wait {
+            println!("Error awaiting epoll: {}.", e);
+            break;
+        }
+
+        wait?.into_par_iter().for_each(|(event, ctx)| {
+            let mut lock = match ctx.try_lock() {
+                Err(TryLockError::WouldBlock) => {
+                    return;
+                }
+                Err(TryLockError::Poisoned(g)) => {
+                    let inner = g.into_inner();
+                    match &*inner {
+                        Context::Ref(_) => panic!("Unreachable"),
+                        Context::Listener(_) => {
+                            ctx.clear_poison();
+                            inner
+                        }
+                        Context::Conn(c) => {
+                            if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
+                                println!("Error removing closed connection: {}.", e);
+                            }
+                            return;
+                        }
+                    }
+                }
+                Ok(lock) => lock,
+            };
+
+            match &mut *lock {
+                Context::Ref(_) => {
+                    panic!("Unreachable Context::Ref");
+                }
+                Context::Listener(x) => match x.accept() {
+                    Err(e) => {
+                        println!("Error accepting connection: {}.", e);
+                        backoff_helper(
+                            Arc::downgrade(&backoff),
+                            Arc::downgrade(&epfd),
+                            x.as_raw_fd(),
+                        );
+                        return;
+                    }
+                    Ok((s, p)) => {
+                        backoff.store(0, Ordering::Relaxed);
+                        let w = match s.try_clone() {
+                            Ok(x) => x,
+                            Err(e) => {
+                                println!("Error accepting connection from {}: {}", p, e);
+                                backoff_helper(
+                                    Arc::downgrade(&backoff),
+                                    Arc::downgrade(&epfd),
+                                    x.as_raw_fd(),
+                                );
+                                return;
+                            }
+                        };
+                        let br = BufReader::new(LimitedReader::new(s, None));
+                        let c = Conn {
+                            w: w,
+                            br: br,
+                            peer: p,
+                        };
+
+                        let res = epfd.add(Context::Conn(c), Events::EPOLLIN | Events::EPOLLRDHUP);
+
+                        if let Err(e) = res {
+                            println!("Error monitoring: {}", e);
+                        }
+                    }
+                },
+                Context::Conn(c) => {
+                    if event.contains(Events::EPOLLRDHUP) {
+                        if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
+                            println!("Error removing closed connection: {}.", e);
+                        }
+                        return;
+                    }
+
+                    match read_request(&mut c.br, max_header_bytes) {
+                        Ok(_req) => {
+                            if let Err(e) = c.w.write(HELLO) {
+                                println!("Error sending reply: {}.", e);
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error parsing request: {}.", e);
+                            if let Err(e) = c.w.write(BAD_REQUEST) {
+                                if e.kind() == ErrorKind::BrokenPipe {
+                                    if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
+                                        println!("Error removing closed connection: {}.", e);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                }
+            };
+        });
+    }
+    Ok(())
+}
+
+static HELLO: &[u8; 92] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!";
+
+static BAD_REQUEST: &[u8; 103] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
+
+fn backoff_helper(
+    bo: Weak<AtomicU64>,
+    epfd: Weak<Epoll<Context<TcpStream, TcpStream>>>,
+    fd: RawFd,
+) {
     let dur = match bo.upgrade() {
         None => return,
         Some(bo) => {
@@ -445,28 +508,31 @@ fn backoff_helper(bo: Weak<AtomicU64>, epfd: Weak<Epoll<Context<TcpStream, TcpSt
             bo.store(tmp, Ordering::Release);
 
             Duration::from_millis(tmp)
-        },
+        }
     };
 
-    println!("Backing off accepting new connections for {}ms", dur.as_millis());
+    println!(
+        "Backing off accepting new connections for {}ms",
+        dur.as_millis()
+    );
     thread::spawn(move || {
         if let Some(epfd) = epfd.upgrade() {
             match epfd.modify(Context::Ref(fd), Events::empty()) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     println!("Error modifying events for listener: {}.", e);
                     return;
-                },
+                }
             }
         }
         thread::sleep(dur);
         if let Some(epfd) = epfd.upgrade() {
             match epfd.modify(Context::Ref(fd), Events::EPOLLIN) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     println!("Error modifying events for listener: {}.", e);
                     return;
-                },
+                }
             }
         }
     });

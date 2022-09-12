@@ -1,12 +1,12 @@
+use epoll::{self, ControlOptions, Event, Events};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::{ Error, ErrorKind, Result };
+use std::io::{Error, ErrorKind, Result};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::vec::Vec;
-use epoll::{self, Event, Events, ControlOptions};
 
 pub struct Epoll<C> {
     epfd: OwnedFd,
@@ -16,7 +16,7 @@ pub struct Epoll<C> {
 impl<C: AsRawFd> Epoll<C> {
     pub fn new(b: bool) -> Result<Self> {
         let epfd = epoll::create(b)?;
-        Ok(Self{
+        Ok(Self {
             epfd: unsafe { OwnedFd::from_raw_fd(epfd) },
             es: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -67,19 +67,21 @@ impl<C: AsRawFd> Epoll<C> {
         };
 
         let mut buf = {
-            let lock = self.es.lock().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            let lock = self
+                .es
+                .lock()
+                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
             vec![Event::new(Events::empty(), 0); max(lock.len(), 1)]
         };
 
-        let count = epoll::wait(
-            self.epfd.as_raw_fd(),
-            timeout,
-            buf.as_mut_slice(),
-        )?;
+        let count = epoll::wait(self.epfd.as_raw_fd(), timeout, buf.as_mut_slice())?;
         buf.truncate(count);
 
         let mut res: Vec<(Events, Arc<Mutex<C>>)> = Vec::with_capacity(count);
-        let lock = self.es.lock().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+        let lock = self
+            .es
+            .lock()
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         for x in buf.iter() {
             let events = Events::from_bits_truncate(x.events);
             let data: RawFd = x.data.try_into().unwrap();
