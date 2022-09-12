@@ -1,19 +1,19 @@
-use std::io::Result;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::io::{ Error, ErrorKind, Result };
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::vec::Vec;
 use epoll::{self, Event, Events, ControlOptions};
 
-struct Epoll {
+pub struct Epoll<C> {
     epfd: OwnedFd,
-    es: Arc<Mutex<HashMap<RawFd, u32>>>,
+    es: Arc<Mutex<HashMap<RawFd, Arc<Mutex<C>>>>>,
 }
 
-impl Epoll {
-    fn new(b: bool) -> Result<Self> {
+impl<C: AsRawFd> Epoll<C> {
+    pub fn new(b: bool) -> Result<Self> {
         let epfd = epoll::create(b)?;
         Ok(Self{
             epfd: unsafe { OwnedFd::from_raw_fd(epfd) },
@@ -21,52 +21,60 @@ impl Epoll {
         })
     }
 
-    fn add<'a, T>(&self, t: &'a T, events: Events) -> Result<()> where &'a T: AsRawFd {
-        let res = epoll::ctl(
+    pub fn add(&self, c: C, events: Events) -> Result<()> {
+        let fd = c.as_raw_fd();
+        epoll::ctl(
             self.epfd.as_raw_fd(),
             ControlOptions::EPOLL_CTL_ADD,
-            t.as_raw_fd(), 
-            Event::new(events, 0),
+            fd,
+            Event::new(events, fd.try_into().unwrap()),
         )?;
 
-        let ones = events.bits().count_ones();
         let mut lock = self.es.lock().unwrap();
-        lock.insert(t.as_raw_fd(), ones);
+        lock.insert(c.as_raw_fd(), Arc::new(Mutex::new(c)));
         Ok(())
     }
 
-    fn remove<'a, T>(&self, t: &'a T) -> Result<()> where &'a T: AsRawFd {
-        let res = epoll::ctl(
+    pub fn remove(&self, c: C) -> Result<Option<Arc<Mutex<C>>>> {
+        let fd = c.as_raw_fd();
+        epoll::ctl(
             self.epfd.as_raw_fd(),
             ControlOptions::EPOLL_CTL_DEL,
-            t.as_raw_fd(), 
+            fd,
             Event::new(Events::empty(), 0),
         )?;
 
         let mut lock = self.es.lock().unwrap();
-        lock.remove(&t.as_raw_fd());
-        Ok(())
+        Ok(lock.remove(&fd))
     }
 
-    fn wait(&self, timeout: Option<Duration>) -> Result<Vec<Event>> {
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<Vec<(Events, Arc<Mutex<C>>)>> {
         let timeout: i32 = match timeout {
             Some(d) => d.as_millis().try_into().unwrap_or(i32::MAX),
             None => -1,
         };
 
-        let lock = self.es.lock().unwrap();
-        let size = lock.values().fold(0, |a, x| a + x);
-        let mut buf = vec![Event::new(Events::empty(), 0); size as usize];
-        drop(lock);
+        let mut buf = {
+            let lock = self.es.lock().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            vec![Event::new(Events::empty(), 0); lock.len()]
+        };
 
         let count = epoll::wait(
             self.epfd.as_raw_fd(),
             timeout,
             buf.as_mut_slice(),
         )?;
-
         buf.truncate(count);
 
-        Ok(buf)
+        let mut res: Vec<(Events, Arc<Mutex<C>>)> = Vec::with_capacity(count);
+        let lock = self.es.lock().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+        for x in buf.iter() {
+            let events = Events::from_bits_truncate(x.events);
+            let data: RawFd = x.data.try_into().unwrap();
+            if let Some(x) = lock.get(&data) {
+                res.push((events, x.clone()));
+            }
+        }
+        Ok(res)
     }
 }

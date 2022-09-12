@@ -9,17 +9,22 @@ mod ep;
 mod tests;
 
 use std::boxed::Box;
-use std::cmp;
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{ BufRead, BufReader, Read, Write };
+use std::net::{ SocketAddr, TcpListener, TcpStream };
+use std::os::unix::io::{ AsRawFd, RawFd };
 use std::result::Result;
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 use std::vec::Vec;
-use uri::Uri;
-//use ep::Epoll;
+
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
+use rayon::ThreadPoolBuilder;
+use epoll::Events;
+
+use ep::Epoll;
 
 #[derive(Debug)]
 pub enum Method {
@@ -229,9 +234,32 @@ pub trait Handler {
     fn serve_http(&self, r: Request) -> Response;
 }
 
+enum Context<W: Write + AsRawFd, R: Read> {
+    Listener(TcpListener),
+    Conn(Conn<W, R>),
+    Ref(RawFd),
+}
+
+impl<W: Write + AsRawFd, R: Read> AsRawFd for Context<W, R> {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Listener(l) => l.as_raw_fd(),
+            Self::Conn(c) => c.w.as_raw_fd(),
+            Self::Ref(fd) => *fd,
+        }
+    }
+}
+
+struct Conn<W: Write + AsRawFd, R: Read> {
+    w: W,
+    br: BufReader<LimitedReader<R>>,
+    peer: SocketAddr,
+}
+
 pub struct Server<T: Handler + Send + Sync> {
     handler: T,
     max_header_bytes: usize,
+    concurrency: usize,
 }
 
 impl<T: Handler + Send + Sync> Server<T> {
@@ -239,6 +267,7 @@ impl<T: Handler + Send + Sync> Server<T> {
         Server {
             handler: h,
             max_header_bytes: 1 << 20,
+            concurrency: 32,
         }
     }
 
@@ -249,43 +278,68 @@ impl<T: Handler + Send + Sync> Server<T> {
     }
 
     pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
-        let mut backoff = Duration::from_millis(0);
-        thread::scope(|s| {
-            for stream in l.incoming() {
-                if let Err(_) = stream {
-                    backoff = if backoff.is_zero() {
-                        Duration::from_millis(5)
-                    } else {
-                        cmp::min(Duration::from_millis(1000), backoff.saturating_mul(2))
-                    };
-                    thread::sleep(backoff);
-                    continue;
-                }
+        let epfd: Epoll<Context<TcpStream, TcpStream>> = Epoll::new(false)?;
+        epfd.add(Context::Listener(l), Events::EPOLLIN)?;
 
-                // Unwrap is safe because we caught the error above.
-                let stream = stream.unwrap();
-                backoff = Duration::from_millis(0);
-                s.spawn(move || {
-                    let mut w = stream.try_clone().unwrap();
-                    let mut br = BufReader::new(LimitedReader::new(&stream, None));
-                    loop {
-                        match br.has_data_left() {
-                            Ok(true) => (),
-                            _ => {
-                                break;
-                            },
+        ThreadPoolBuilder::new().num_threads(self.concurrency).build()?.install(|| {
+            let mut backoff = Duration::from_millis(0);
+            loop {
+                epfd.wait(None).unwrap().par_iter().for_each(|(event, ctx)| {
+                    match &mut *ctx.lock().unwrap() {
+                        Context::Ref(_) => {
+                            panic!("Unreachable Context::Ref");
                         }
-                        match read_request(&mut br, self.max_header_bytes) {
-                            Ok(req) => {
-                        w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
-                            },
-                            Err(e) => {
-                                w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
-                                println!("{}", e);
-                                break;
+                        Context::Listener(x) => {
+                            match x.accept() {
+                                Err(e) => {
+                                    println!("Error accepting connection: {}.", e);
+                                    return;
+                                    // TODO: backoff logic.
+                                },
+                                Ok((s, p)) => {
+                                    let w = match s.try_clone() {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            println!("Error accepting connection from {}: {}", p, e);
+                                            return;
+                                        }
+                                    };
+                                    let br = BufReader::new(LimitedReader::new(s, None));
+                                    let c = Conn{
+                                        w: w,
+                                        br: br,
+                                        peer: p,
+                                    };
+
+                                    let res = epfd.add(
+                                        Context::Conn(c),
+                                        Events::EPOLLIN | Events::EPOLLRDHUP,
+                                    );
+
+                                    if let Err(e) = res {
+                                        println!("Error monitoring: {}", e);
+                                    }
+                                }
+                            }
+                        },
+                        Context::Conn(c) => {
+                            if event.contains(Events::EPOLLRDHUP) {
+                                if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
+                                    println!("Error removing closed connection: {}.", e);
+                                }
+                                return;
+                            }
+
+                            match read_request(&mut c.br, self.max_header_bytes) {
+                                Ok(_req) => {
+                                    c.w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
+                                },
+                                Err(e) => {
+                                    c.w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
+                                    println!("{}", e);
+                                }
                             }
                         }
-
                     }
                 });
             }
@@ -341,7 +395,7 @@ fn read_request<R: Read>(
     br.read_line(&mut buf)?;
     buf.remove_matches("\r\n");
 
-    let (method, uri, version) = parse_request_line(&buf)?;
+    let _ = parse_request_line(&buf)?;
     let mut headers = Headers::new();
     loop {
         buf.clear();
