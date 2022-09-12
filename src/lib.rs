@@ -16,10 +16,10 @@ use std::net::{ SocketAddr, TcpListener, TcpStream };
 use std::os::unix::io::{ AsRawFd, RawFd };
 use std::result::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::vec::Vec;
 
-use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
 use epoll::Events;
@@ -234,6 +234,7 @@ pub trait Handler {
     fn serve_http(&self, r: Request) -> Response;
 }
 
+#[derive(Debug)]
 enum Context<W: Write + AsRawFd, R: Read> {
     Listener(TcpListener),
     Conn(Conn<W, R>),
@@ -250,6 +251,7 @@ impl<W: Write + AsRawFd, R: Read> AsRawFd for Context<W, R> {
     }
 }
 
+#[derive(Debug)]
 struct Conn<W: Write + AsRawFd, R: Read> {
     w: W,
     br: BufReader<LimitedReader<R>>,
@@ -278,13 +280,18 @@ impl<T: Handler + Send + Sync> Server<T> {
     }
 
     pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
-        let epfd: Epoll<Context<TcpStream, TcpStream>> = Epoll::new(false)?;
+        let epfd: Arc<Epoll<Context<TcpStream, TcpStream>>> = Arc::new(Epoll::new(false)?);
+        let backoff = AtomicU64::new(0);
         epfd.add(Context::Listener(l), Events::EPOLLIN)?;
 
         ThreadPoolBuilder::new().num_threads(self.concurrency).build()?.install(|| {
-            let mut backoff = Duration::from_millis(0);
             loop {
-                epfd.wait(None).unwrap().par_iter().for_each(|(event, ctx)| {
+                let wait = epfd.wait(None);
+                if let Err(e) = wait {
+                    println!("Error awaiting epoll: {}.", e);
+                    break;
+                }
+                wait.unwrap().into_par_iter().for_each(|(event, ctx)| {
                     match &mut *ctx.lock().unwrap() {
                         Context::Ref(_) => {
                             panic!("Unreachable Context::Ref");
@@ -297,6 +304,7 @@ impl<T: Handler + Send + Sync> Server<T> {
                                     // TODO: backoff logic.
                                 },
                                 Ok((s, p)) => {
+                                    backoff.store(0, Ordering::Relaxed);
                                     let w = match s.try_clone() {
                                         Ok(x) => x,
                                         Err(e) => {
@@ -337,10 +345,10 @@ impl<T: Handler + Send + Sync> Server<T> {
                                 Err(e) => {
                                     c.w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
                                     println!("{}", e);
-                                }
-                            }
+                                },
+                            };
                         }
-                    }
+                    };
                 });
             }
         });
@@ -348,6 +356,7 @@ impl<T: Handler + Send + Sync> Server<T> {
     }
 }
 
+#[derive(Debug)]
 struct LimitedReader<R: Read> {
     remain: Option<usize>,
     r: R,
