@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::{ Error, ErrorKind, Result };
@@ -35,6 +36,17 @@ impl<C: AsRawFd> Epoll<C> {
         Ok(())
     }
 
+    pub fn modify(&self, c: C, events: Events) -> Result<()> {
+        let fd = c.as_raw_fd();
+        epoll::ctl(
+            self.epfd.as_raw_fd(),
+            ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            Event::new(events, fd.try_into().unwrap()),
+        )?;
+        Ok(())
+    }
+
     pub fn remove(&self, c: C) -> Result<Option<Arc<Mutex<C>>>> {
         let fd = c.as_raw_fd();
         epoll::ctl(
@@ -56,7 +68,7 @@ impl<C: AsRawFd> Epoll<C> {
 
         let mut buf = {
             let lock = self.es.lock().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-            vec![Event::new(Events::empty(), 0); lock.len()]
+            vec![Event::new(Events::empty(), 0); max(lock.len(), 1)]
         };
 
         let count = epoll::wait(

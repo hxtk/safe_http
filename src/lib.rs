@@ -15,8 +15,10 @@ use std::io::{ BufRead, BufReader, Read, Write };
 use std::net::{ SocketAddr, TcpListener, TcpStream };
 use std::os::unix::io::{ AsRawFd, RawFd };
 use std::result::Result;
-use std::sync::Arc;
+use std::sync::{ Arc, Weak };
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::vec::Vec;
 
 use rayon::iter::IntoParallelIterator;
@@ -281,7 +283,8 @@ impl<T: Handler + Send + Sync> Server<T> {
 
     pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
         let epfd: Arc<Epoll<Context<TcpStream, TcpStream>>> = Arc::new(Epoll::new(false)?);
-        let backoff = AtomicU64::new(0);
+        let backoff = Arc::new(AtomicU64::new(0));
+
         epfd.add(Context::Listener(l), Events::EPOLLIN)?;
 
         ThreadPoolBuilder::new().num_threads(self.concurrency).build()?.install(|| {
@@ -300,8 +303,12 @@ impl<T: Handler + Send + Sync> Server<T> {
                             match x.accept() {
                                 Err(e) => {
                                     println!("Error accepting connection: {}.", e);
+                                    backoff_helper(
+                                        Arc::downgrade(&backoff),
+                                        Arc::downgrade(&epfd),
+                                        x.as_raw_fd(),
+                                    );
                                     return;
-                                    // TODO: backoff logic.
                                 },
                                 Ok((s, p)) => {
                                     backoff.store(0, Ordering::Relaxed);
@@ -309,6 +316,11 @@ impl<T: Handler + Send + Sync> Server<T> {
                                         Ok(x) => x,
                                         Err(e) => {
                                             println!("Error accepting connection from {}: {}", p, e);
+                                            backoff_helper(
+                                                Arc::downgrade(&backoff),
+                                                Arc::downgrade(&epfd),
+                                                x.as_raw_fd(),
+                                            );
                                             return;
                                         }
                                     };
@@ -354,6 +366,45 @@ impl<T: Handler + Send + Sync> Server<T> {
         });
         Ok(())
     }
+}
+
+fn backoff_helper(bo: Weak<AtomicU64>, epfd: Weak<Epoll<Context<TcpStream, TcpStream>>>, fd: RawFd) {
+    let dur = match bo.upgrade() {
+        None => return,
+        Some(bo) => {
+            let tmp = match bo.load(Ordering::Relaxed) {
+                0 => 5,
+                x if x < 500 => x * 2,
+                _ => 1000,
+            };
+            bo.store(tmp, Ordering::Release);
+
+            Duration::from_millis(tmp)
+        },
+    };
+
+    println!("Backing off accepting new connections for {}ms", dur.as_millis());
+    thread::spawn(move || {
+        if let Some(epfd) = epfd.upgrade() {
+            match epfd.modify(Context::Ref(fd), Events::empty()) {
+                Ok(_) => {},
+                Err(e) => {
+                    println!("Error modifying events for listener: {}.", e);
+                    return;
+                },
+            }
+        }
+        thread::sleep(dur);
+        if let Some(epfd) = epfd.upgrade() {
+            match epfd.modify(Context::Ref(fd), Events::EPOLLIN) {
+                Ok(_) => {},
+                Err(e) => {
+                    println!("Error modifying events for listener: {}.", e);
+                    return;
+                },
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
