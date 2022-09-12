@@ -260,15 +260,80 @@ struct Conn<W: Write + AsRawFd, R: Read> {
     peer: SocketAddr,
 }
 
-pub struct Server<T: Handler + Send + Sync> {
+pub struct TPCServer<T: Handler + Send + Sync> {
+    handler: T,
+    max_header_bytes: usize,
+}
+
+impl<T: Handler + Send + Sync> TPCServer<T> {
+    pub fn new(h: T) -> Self {
+        Self {
+            handler: h,
+            max_header_bytes: 1 << 20,
+        }
+    }
+
+    pub fn listen_and_serve(&self, s: &str) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(s)?;
+        self.serve(listener)?;
+        Ok(())
+    }
+
+    pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+        let mut backoff = Duration::from_millis(0);
+        thread::scope(|s| {
+            for stream in l.incoming() {
+                if let Err(_) = stream {
+                    backoff = if backoff.is_zero() {
+                        Duration::from_millis(5)
+                    } else {
+                        std::cmp::min(Duration::from_millis(1000), backoff.saturating_mul(2))
+                    };
+                    thread::sleep(backoff);
+                    continue;
+                }
+
+                // Unwrap is safe because we caught the error above.
+                let stream = stream.unwrap();
+                backoff = Duration::from_millis(0);
+                s.spawn(move || {
+                    let mut w = stream.try_clone().unwrap();
+                    let mut br = BufReader::new(LimitedReader::new(&stream, None));
+                    loop {
+                        match br.has_data_left() {
+                            Ok(true) => (),
+                            _ => {
+                                break;
+                            },
+                        }
+                        match read_request(&mut br, self.max_header_bytes) {
+                            Ok(req) => {
+                        w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
+                            },
+                            Err(e) => {
+                                w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
+                                println!("{}", e);
+                                break;
+                            }
+                        }
+
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
+}
+
+pub struct PollingServer<T: Handler + Send + Sync> {
     handler: T,
     max_header_bytes: usize,
     concurrency: usize,
 }
 
-impl<T: Handler + Send + Sync> Server<T> {
+impl<T: Handler + Send + Sync> PollingServer<T> {
     pub fn new(h: T) -> Self {
-        Server {
+        Self {
             handler: h,
             max_header_bytes: 1 << 20,
             concurrency: 32,
