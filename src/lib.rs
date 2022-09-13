@@ -3,13 +3,13 @@
 #![feature(assert_matches)]
 #![feature(mutex_unpoison)]
 
+#[cfg(test)]
+mod tests;
+
 mod ep;
 mod headers;
 mod limited_reader;
 mod uri;
-
-#[cfg(test)]
-mod tests;
 
 use std::boxed::Box;
 use std::error::Error;
@@ -23,6 +23,9 @@ use std::thread;
 use std::time::Duration;
 
 use epoll::Events;
+use rustls::ServerConfig;
+use rustls::ServerConnection;
+use rustls::StreamOwned;
 
 use ep::Epoll;
 use headers::Headers;
@@ -70,37 +73,58 @@ pub trait Handler {
 }
 
 pub trait Server {
-    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>>;
+    fn serve<F, S: Read + Write + Send>(
+        &self,
+        l: TcpListener,
+        connector: F,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: Copy + Send + FnMut(TcpStream) -> Result<S, Box<dyn Error>>;
 
     fn listen_and_serve(&self, s: &str) -> Result<(), Box<dyn Error>> {
         let listener = TcpListener::bind(s)?;
-        self.serve(listener)?;
+        self.serve(listener, |x| Ok(x))?;
+        Ok(())
+    }
+
+    fn listen_and_serve_tls(
+        &self,
+        s: &str,
+        config: Arc<ServerConfig>,
+    ) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(s)?;
+        self.serve(listener, |x| {
+            Ok(StreamOwned::new(
+                ServerConnection::new(Arc::clone(&config))?,
+                x,
+            ))
+        })?;
         Ok(())
     }
 }
 
 #[derive(Debug)]
-enum Context<W: Write + AsRawFd, R: Read> {
+enum Context<S: Read + Write> {
     Listener(TcpListener),
-    Conn(Conn<W, R>),
+    Conn(Conn<S>),
     Ref(RawFd),
 }
 
-impl<W: Write + AsRawFd, R: Read> AsRawFd for Context<W, R> {
+impl<S: Read + Write> AsRawFd for Context<S> {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Self::Listener(l) => l.as_raw_fd(),
-            Self::Conn(c) => c.w.as_raw_fd(),
+            Self::Conn(c) => c.fd,
             Self::Ref(fd) => *fd,
         }
     }
 }
 
 #[derive(Debug)]
-struct Conn<W: Write + AsRawFd, R: Read> {
-    w: W,
-    br: BufReader<LimitedReader<R>>,
+struct Conn<S: Read + Write> {
+    br: BufReader<LimitedReader<S>>,
     peer: SocketAddr,
+    fd: RawFd,
 }
 
 pub struct TPCServer<T: Handler + Send + Sync> {
@@ -118,50 +142,57 @@ impl<T: Handler + Send + Sync> TPCServer<T> {
 }
 
 impl<T: Handler + Send + Sync> Server for TPCServer<T> {
-    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+    fn serve<F, S: Read + Write + Send>(
+        &self,
+        l: TcpListener,
+        mut transformer: F,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: Copy + Send + FnMut(TcpStream) -> Result<S, Box<dyn Error>>,
+    {
         let mut backoff = Duration::from_millis(0);
         thread::scope(|s| {
             for stream in l.incoming() {
-                if let Err(_) = stream {
-                    backoff = if backoff.is_zero() {
-                        Duration::from_millis(5)
-                    } else {
-                        std::cmp::min(Duration::from_millis(1000), backoff.saturating_mul(2))
-                    };
-                    thread::sleep(backoff);
-                    continue;
-                }
+                let stream = match stream {
+                    Err(_) => {
+                        backoff = if backoff.is_zero() {
+                            Duration::from_millis(5)
+                        } else {
+                            std::cmp::min(Duration::from_millis(1000), backoff.saturating_mul(2))
+                        };
+                        thread::sleep(backoff);
+                        continue;
+                    }
+                    Ok(x) => match transformer(x) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("Error opening TLS connection: {}.", e);
+                            return;
+                        }
+                    },
+                };
 
                 // Unwrap is safe because we caught the error above.
-                let stream = stream.unwrap();
                 backoff = Duration::from_millis(0);
                 s.spawn(move || {
-                    // TODO: Move this block before the thread spawn.
-                    // On error, we should be backing off accepting
-                    // new connections.
-                    let mut w = match stream.try_clone() {
-                        Ok(x) => x,
-                        Err(_) => return,
-                    };
-                    let mut br = BufReader::new(LimitedReader::new(&stream, None));
+                    let mut br = BufReader::new(LimitedReader::new(stream, None));
                     loop {
                         match br.has_data_left() {
                             Ok(true) => (),
                             _ => {
                                 break;
-                            },
+                            }
                         };
                         match read_request(&mut br, self.max_header_bytes) {
                             Ok(req) => {
-                        w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
-                            },
+                                br.get_mut().get_mut().write(HELLO).unwrap();
+                            }
                             Err(e) => {
-                                w.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request").unwrap();
+                                br.get_mut().get_mut().write(BAD_REQUEST).unwrap();
                                 println!("{}", e);
                                 break;
                             }
                         }
-
                     }
                 });
             }
@@ -187,7 +218,14 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
 }
 
 impl<T: Handler + Send + Sync> Server for PollingServer<T> {
-    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+    fn serve<F, S: Read + Write + Send>(
+        &self,
+        l: TcpListener,
+        transformer: F,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        F: Copy + Send + FnMut(TcpStream) -> Result<S, Box<dyn Error>>,
+    {
         l.set_nonblocking(true)?;
 
         let lock = Arc::new(Mutex::new(()));
@@ -200,24 +238,28 @@ impl<T: Handler + Send + Sync> Server for PollingServer<T> {
                 let epfd = Arc::clone(&epfd);
                 let backoff = Arc::clone(&backoff);
                 let header_bytes = self.max_header_bytes;
-                s.spawn(
-                    move || match server_loop(lock, epfd, backoff, header_bytes) {
+                s.spawn(move || {
+                    match server_loop(lock, epfd, backoff, header_bytes, transformer) {
                         Ok(_) => println!("{:?} exited silently.", thread::current().id()),
                         Err(e) => println!("{:?} errored: {}.", thread::current().id(), e),
-                    },
-                );
+                    }
+                });
             }
         });
         Ok(())
     }
 }
 
-fn server_loop(
+fn server_loop<F, S: Read + Write + Send>(
     lock: Arc<Mutex<()>>,
-    epfd: Arc<Epoll<Context<TcpStream, TcpStream>>>,
+    epfd: Arc<Epoll<Context<S>>>,
     backoff: Arc<AtomicU64>,
     max_header_bytes: usize,
-) -> Result<(), Box<dyn Error>> {
+    mut transformer: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(TcpStream) -> Result<S, Box<dyn Error>>,
+{
     loop {
         let (event, ctx) = {
             let _guard = lock.lock().unwrap_or_else(|e| {
@@ -251,12 +293,12 @@ fn server_loop(
                         // If a client connection became poisoned,
                         // all we can do is drop it. The context
                         // may not be well-defined.
-                        // 
+                        //
                         // TODO: We may be able to get away with
                         // clearing the buffer on the BufReader
                         // and requiring any future client state
                         // to be Sync.
-                        close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                        close(c.fd, &epfd);
                         continue;
                     }
                 }
@@ -283,23 +325,12 @@ fn server_loop(
                 }
                 Ok((s, p)) => {
                     backoff.store(0, Ordering::Relaxed);
-                    let w = match s.try_clone() {
-                        Ok(x) => x,
-                        Err(e) => {
-                            println!("Error accepting connection from {}: {}", p, e);
-                            backoff_helper(
-                                Arc::downgrade(&backoff),
-                                Arc::downgrade(&epfd),
-                                x.as_raw_fd(),
-                            );
-                            continue;
-                        }
-                    };
-                    let br = BufReader::new(LimitedReader::new(s, None));
+                    let fd = s.as_raw_fd();
+                    let br = BufReader::new(LimitedReader::new(transformer(s)?, None));
                     let c = Conn {
-                        w: w,
                         br: br,
                         peer: p,
+                        fd: fd,
                     };
 
                     let res = epfd.add(Context::Conn(c), Events::EPOLLIN | Events::EPOLLRDHUP);
@@ -311,33 +342,31 @@ fn server_loop(
             },
             Context::Conn(c) => {
                 if event.contains(Events::EPOLLRDHUP) {
-                    close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                    close(c.fd, &epfd);
                     continue;
                 }
 
-                c.br.get_ref().get_ref().set_nonblocking(true)?;
                 match c.br.has_data_left() {
                     Ok(true) => (),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         continue;
                     }
                     _ => {
-                        close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                        close(c.fd, &epfd);
                         continue;
                     }
                 };
-                c.br.get_ref().get_ref().set_nonblocking(false)?;
                 match read_request(&mut c.br, max_header_bytes) {
                     Ok(_req) => {
-                        if let Err(e) = c.w.write(HELLO) {
+                        if let Err(e) = c.br.get_mut().get_mut().write(HELLO) {
                             println!("Error sending reply: {}.", e);
                         }
                     }
                     Err(e) => {
                         println!("Error parsing request: {}.", e);
-                        if let Err(e) = c.w.write(BAD_REQUEST) {
+                        if let Err(e) = c.br.get_mut().get_mut().write(BAD_REQUEST) {
                             if e.kind() == ErrorKind::BrokenPipe {
-                                close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                                close(c.fd, &epfd);
                                 continue;
                             }
                         }
@@ -348,7 +377,7 @@ fn server_loop(
     }
 }
 
-fn close(fd: RawFd, epfd: Arc<Epoll<Context<TcpStream, TcpStream>>>) {
+fn close<S: Read + Write>(fd: RawFd, epfd: &Arc<Epoll<Context<S>>>) {
     if let Err(e) = epfd.remove(Context::Ref(fd)) {
         println!("Error removing closed connection: {}.", e);
     }
@@ -358,9 +387,9 @@ static HELLO: &[u8; 92] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=
 
 static BAD_REQUEST: &[u8; 103] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
 
-fn backoff_helper(
+fn backoff_helper<S: Read + Write + Send>(
     bo: Weak<AtomicU64>,
-    epfd: Weak<Epoll<Context<TcpStream, TcpStream>>>,
+    epfd: Weak<Epoll<Context<S>>>,
     fd: RawFd,
 ) {
     let dur = match bo.upgrade() {
@@ -381,29 +410,26 @@ fn backoff_helper(
         "Backing off accepting new connections for {}ms",
         dur.as_millis()
     );
-    thread::spawn(move || {
-        if let Some(epfd) = epfd.upgrade() {
-            match epfd.modify(Context::Ref(fd), Events::empty()) {
-                Ok(_) => {}
-                Err(e) => {
-                    println!("Error modifying events for listener: {}.", e);
-                    return;
-                }
+    if let Some(epfd) = epfd.upgrade() {
+        match epfd.modify(Context::Ref(fd), Events::empty()) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Error modifying events for listener: {}.", e);
+                return;
             }
         }
-        thread::sleep(dur);
-        if let Some(epfd) = epfd.upgrade() {
-            match epfd.modify(Context::Ref(fd), Events::EPOLLIN) {
-                Ok(_) => {}
-                Err(e) => {
-                    println!("Error modifying events for listener: {}.", e);
-                    return;
-                }
+    }
+    thread::sleep(dur);
+    if let Some(epfd) = epfd.upgrade() {
+        match epfd.modify(Context::Ref(fd), Events::EPOLLIN) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Error modifying events for listener: {}.", e);
+                return;
             }
         }
-    });
+    }
 }
-
 
 fn read_request<R: Read>(
     br: &mut BufReader<LimitedReader<R>>,

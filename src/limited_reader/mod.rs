@@ -23,6 +23,14 @@ impl<R: Read> LimitedReader<R> {
     pub fn get_ref(&self) -> &R {
         &self.r
     }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.r
+    }
+
+    pub fn inner(self) -> R {
+        self.r
+    }
 }
 
 impl<R: Read> Read for LimitedReader<R> {

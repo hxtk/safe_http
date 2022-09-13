@@ -175,7 +175,7 @@ impl<C: AsRawFd> Epoll<C> {
         let data: RawFd = buf[0].data.try_into().unwrap();
         match lock.get(&data) {
             Some(x) => Ok(Some((events, Arc::clone(x)))),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 }
