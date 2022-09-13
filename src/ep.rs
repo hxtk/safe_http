@@ -145,4 +145,37 @@ impl<C: AsRawFd> Epoll<C> {
         }
         Ok(res)
     }
+
+    /// Wait for the Epoll to indicate one of its monitored files is ready.
+    ///
+    /// Timeout indicates the duration for which Epoll should wait for a result.
+    /// A timeout of None will cause epoll to block indefinitely.
+    ///
+    /// The return value will be a vector of tuples for all file descriptors that
+    /// had events to report, including the bitfield of triggered `Events` and a
+    /// strong reference to the stored context object for that file descriptor.
+    pub fn wait_one(&self, timeout: Option<Duration>) -> Result<Option<(Events, Arc<Mutex<C>>)>> {
+        let timeout: i32 = match timeout {
+            Some(d) => d.as_millis().try_into().unwrap_or(i32::MAX),
+            None => -1,
+        };
+
+        let mut buf = [Event::new(Events::empty(), 0); 1];
+        let count = epoll::wait(self.epfd.as_raw_fd(), timeout, &mut buf)?;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let lock = self
+            .es
+            .lock()
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+        let events = Events::from_bits_truncate(buf[0].events);
+        let data: RawFd = buf[0].data.try_into().unwrap();
+        match lock.get(&data) {
+            Some(x) => Ok(Some((events, Arc::clone(x)))),
+            None => Ok(None)
+        }
+    }
 }

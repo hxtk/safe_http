@@ -5,13 +5,13 @@
 
 mod ep;
 mod headers;
+mod limited_reader;
 mod uri;
 
 #[cfg(test)]
 mod tests;
 
 use std::boxed::Box;
-use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -21,15 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::thread;
 use std::time::Duration;
-use std::vec::Vec;
 
 use epoll::Events;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
-use rayon::ThreadPoolBuilder;
 
 use ep::Epoll;
 use headers::Headers;
+use limited_reader::LimitedReader;
 
 #[derive(Debug)]
 pub enum Method {
@@ -139,7 +136,13 @@ impl<T: Handler + Send + Sync> Server for TPCServer<T> {
                 let stream = stream.unwrap();
                 backoff = Duration::from_millis(0);
                 s.spawn(move || {
-                    let mut w = stream.try_clone().unwrap();
+                    // TODO: Move this block before the thread spawn.
+                    // On error, we should be backing off accepting
+                    // new connections.
+                    let mut w = match stream.try_clone() {
+                        Ok(x) => x,
+                        Err(_) => return,
+                    };
                     let mut br = BufReader::new(LimitedReader::new(&stream, None));
                     loop {
                         match br.has_data_left() {
@@ -185,6 +188,8 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
 
 impl<T: Handler + Send + Sync> Server for PollingServer<T> {
     fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+        l.set_nonblocking(true)?;
+
         let lock = Arc::new(Mutex::new(()));
         let epfd = Arc::new(Epoll::new(false)?);
         let backoff = Arc::new(AtomicU64::new(0));
@@ -214,111 +219,132 @@ fn server_loop(
     max_header_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        let wait = {
-            let _guard = lock.lock().unwrap_or_else(|mut e| {
+        let (event, ctx) = {
+            let _guard = lock.lock().unwrap_or_else(|e| {
                 lock.clear_poison();
                 e.into_inner()
             });
 
-            epfd.wait(None)
-        }?;
+            match epfd.wait_one(None)? {
+                Some(x) => x,
+                None => continue,
+            }
+        };
 
-        wait.into_par_iter().for_each(|(event, ctx)| {
-            let mut lock = match ctx.try_lock() {
-                Err(TryLockError::WouldBlock) => {
-                    return;
-                }
-                Err(TryLockError::Poisoned(g)) => {
-                    let inner = g.into_inner();
-                    match &*inner {
-                        Context::Ref(_) => panic!("Unreachable"),
-                        Context::Listener(_) => {
-                            ctx.clear_poison();
-                            inner
-                        }
-                        Context::Conn(c) => {
-                            close(c.w.as_raw_fd(), Arc::clone(&epfd));
-                            return;
-                        }
+        let mut lock = match ctx.try_lock() {
+            Err(TryLockError::WouldBlock) => {
+                // Some other thread is currently processing this event.
+                continue;
+            }
+            Err(TryLockError::Poisoned(g)) => {
+                let inner = g.into_inner();
+                match &*inner {
+                    Context::Ref(_) => panic!("Unreachable"),
+                    Context::Listener(_) => {
+                        // A listener consists only of a TcpSocket,
+                        // which is thread-safe anyway, so we clear
+                        // the poison.
+                        ctx.clear_poison();
+                        inner
                     }
-                }
-                Ok(lock) => lock,
-            };
-
-            match &mut *lock {
-                Context::Ref(_) => {
-                    panic!("Unreachable Context::Ref");
-                }
-                Context::Listener(x) => match x.accept() {
-                    Err(e) => {
-                        println!("Error accepting connection: {}.", e);
-                        backoff_helper(
-                            Arc::downgrade(&backoff),
-                            Arc::downgrade(&epfd),
-                            x.as_raw_fd(),
-                        );
-                        return;
-                    }
-                    Ok((s, p)) => {
-                        backoff.store(0, Ordering::Relaxed);
-                        let w = match s.try_clone() {
-                            Ok(x) => x,
-                            Err(e) => {
-                                println!("Error accepting connection from {}: {}", p, e);
-                                backoff_helper(
-                                    Arc::downgrade(&backoff),
-                                    Arc::downgrade(&epfd),
-                                    x.as_raw_fd(),
-                                );
-                                return;
-                            }
-                        };
-                        let br = BufReader::new(LimitedReader::new(s, None));
-                        let c = Conn {
-                            w: w,
-                            br: br,
-                            peer: p,
-                        };
-
-                        let res = epfd.add(Context::Conn(c), Events::EPOLLIN | Events::EPOLLRDHUP);
-
-                        if let Err(e) = res {
-                            println!("Error monitoring: {}", e);
-                        }
-                    }
-                },
-                Context::Conn(c) => {
-                    if event.contains(Events::EPOLLRDHUP) {
+                    Context::Conn(c) => {
+                        // If a client connection became poisoned,
+                        // all we can do is drop it. The context
+                        // may not be well-defined.
+                        // 
+                        // TODO: We may be able to get away with
+                        // clearing the buffer on the BufReader
+                        // and requiring any future client state
+                        // to be Sync.
                         close(c.w.as_raw_fd(), Arc::clone(&epfd));
-                        return;
+                        continue;
                     }
-
-                    match c.br.has_data_left() {
-                        Ok(true) => (),
-                        _ => {
-                            close(c.w.as_raw_fd(), Arc::clone(&epfd));
-                            return;
-                        }
-                    };
-                    match read_request(&mut c.br, max_header_bytes) {
-                        Ok(_req) => {
-                            if let Err(e) = c.w.write(HELLO) {
-                                println!("Error sending reply: {}.", e);
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error parsing request: {}.", e);
-                            if let Err(e) = c.w.write(BAD_REQUEST) {
-                                if e.kind() == ErrorKind::BrokenPipe {
-                                    close(c.w.as_raw_fd(), Arc::clone(&epfd));
-                                    return;
-                                }
-                            }
-                        }
-                    };
                 }
-            };
-        });
+            }
+            Ok(lock) => lock,
+        };
+
+        match &mut *lock {
+            Context::Ref(_) => {
+                panic!("Unreachable Context::Ref");
+            }
+            Context::Listener(x) => match x.accept() {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    println!("Error accepting connection: {}.", e);
+                    backoff_helper(
+                        Arc::downgrade(&backoff),
+                        Arc::downgrade(&epfd),
+                        x.as_raw_fd(),
+                    );
+                    continue;
+                }
+                Ok((s, p)) => {
+                    backoff.store(0, Ordering::Relaxed);
+                    let w = match s.try_clone() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            println!("Error accepting connection from {}: {}", p, e);
+                            backoff_helper(
+                                Arc::downgrade(&backoff),
+                                Arc::downgrade(&epfd),
+                                x.as_raw_fd(),
+                            );
+                            continue;
+                        }
+                    };
+                    let br = BufReader::new(LimitedReader::new(s, None));
+                    let c = Conn {
+                        w: w,
+                        br: br,
+                        peer: p,
+                    };
+
+                    let res = epfd.add(Context::Conn(c), Events::EPOLLIN | Events::EPOLLRDHUP);
+
+                    if let Err(e) = res {
+                        println!("Error monitoring: {}", e);
+                    }
+                }
+            },
+            Context::Conn(c) => {
+                if event.contains(Events::EPOLLRDHUP) {
+                    close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                    continue;
+                }
+
+                c.br.get_ref().get_ref().set_nonblocking(true)?;
+                match c.br.has_data_left() {
+                    Ok(true) => (),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    _ => {
+                        close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                        continue;
+                    }
+                };
+                c.br.get_ref().get_ref().set_nonblocking(false)?;
+                match read_request(&mut c.br, max_header_bytes) {
+                    Ok(_req) => {
+                        if let Err(e) = c.w.write(HELLO) {
+                            println!("Error sending reply: {}.", e);
+                        }
+                    }
+                    Err(e) => {
+                        println!("Error parsing request: {}.", e);
+                        if let Err(e) = c.w.write(BAD_REQUEST) {
+                            if e.kind() == ErrorKind::BrokenPipe {
+                                close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                                continue;
+                            }
+                        }
+                    }
+                };
+            }
+        };
     }
 }
 
@@ -378,44 +404,6 @@ fn backoff_helper(
     });
 }
 
-#[derive(Debug)]
-struct LimitedReader<R: Read> {
-    remain: Option<usize>,
-    r: R,
-}
-
-impl<R: Read> LimitedReader<R> {
-    fn new(r: R, limit: Option<usize>) -> LimitedReader<R> {
-        LimitedReader {
-            remain: limit,
-            r: r,
-        }
-    }
-    fn set_limit(&mut self, s: usize) {
-        self.remain = Some(s)
-    }
-    fn unset_limit(&mut self) {
-        self.remain = None
-    }
-}
-
-impl<R: Read> Read for LimitedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.remain {
-            None => self.r.read(buf),
-            Some(remain) => {
-                let buf = if remain < buf.len() {
-                    &mut buf[..remain]
-                } else {
-                    buf
-                };
-                let res = self.r.read(buf)?;
-                self.remain = Some(remain - res);
-                Ok(res)
-            }
-        }
-    }
-}
 
 fn read_request<R: Read>(
     br: &mut BufReader<LimitedReader<R>>,
