@@ -1,7 +1,8 @@
-#![feature(buf_read_has_data_left)]
-#![feature(string_remove_matches)]
 #![feature(assert_matches)]
+#![feature(buf_read_has_data_left)]
 #![feature(mutex_unpoison)]
+#![feature(min_specialization)]
+#![feature(string_remove_matches)]
 
 #[cfg(test)]
 mod tests;
@@ -76,7 +77,7 @@ pub trait Server {
     fn serve<F, S: Read + Write + Send>(
         &self,
         l: TcpListener,
-        connector: F,
+        transformer: F,
     ) -> Result<(), Box<dyn Error>>
     where
         F: Copy + Send + FnMut(TcpStream) -> Result<S, Box<dyn Error>>;
@@ -120,11 +121,33 @@ impl<S: Read + Write> AsRawFd for Context<S> {
     }
 }
 
+trait SetNonblocking {
+    fn set_nonblocking(&self, nb: bool) -> std::io::Result<()>;
+}
+
 #[derive(Debug)]
 struct Conn<S: Read + Write> {
     br: BufReader<LimitedReader<S>>,
     peer: SocketAddr,
     fd: RawFd,
+}
+
+impl SetNonblocking for Conn<TcpStream> {
+    fn set_nonblocking(&self, nb: bool) -> std::io::Result<()> {
+        self.br.get_ref().get_ref().set_nonblocking(nb)
+    }
+}
+
+impl SetNonblocking for Conn<StreamOwned<ServerConnection, TcpStream>> {
+    fn set_nonblocking(&self, nb: bool) -> std::io::Result<()> {
+        self.br.get_ref().get_ref().sock.set_nonblocking(nb)
+    }
+}
+
+impl<S: Read + Write> SetNonblocking for Conn<S> {
+    default fn set_nonblocking(&self, nb: bool) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct TPCServer<T: Handler + Send + Sync> {
@@ -346,6 +369,7 @@ where
                     continue;
                 }
 
+                c.set_nonblocking(true)?;
                 match c.br.has_data_left() {
                     Ok(true) => (),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -356,6 +380,7 @@ where
                         continue;
                     }
                 };
+                c.set_nonblocking(false)?;
                 match read_request(&mut c.br, max_header_bytes) {
                     Ok(_req) => {
                         if let Err(e) = c.br.get_mut().get_mut().write(HELLO) {
