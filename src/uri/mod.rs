@@ -18,7 +18,7 @@ pub enum UriRef {
 pub struct RelativeUri {
     relative_part: RelativePart,
     query: Option<Query>,
-    fragment: Option<String>,
+    fragment: Option<Fragment>,
 }
 
 enum RelativePart {
@@ -33,7 +33,7 @@ pub struct Uri {
     scheme: Scheme,
     hier_part: HierPart,
     query: Option<Query>,
-    fragment: Option<String>,
+    fragment: Option<Fragment>,
 }
 
 impl std::convert::TryFrom<&str> for Uri {
@@ -44,6 +44,7 @@ impl std::convert::TryFrom<&str> for Uri {
             .split_once(':')
             .ok_or("uri must contain at least one ':'")?;
         let scheme = Scheme::new(scheme.to_string())?;
+        println!("Parsed scheme: {}.", scheme.get());
 
         let (hier_part, remain) = if let Some(idx) = remain.find('?') {
             remain.split_at(idx)
@@ -52,6 +53,7 @@ impl std::convert::TryFrom<&str> for Uri {
         } else {
             (remain, "")
         };
+        println!("hier-part: {}", hier_part);
 
         let hier_part = if hier_part.starts_with("//") {
             let (authority, path) = hier_part[2..]
@@ -60,7 +62,10 @@ impl std::convert::TryFrom<&str> for Uri {
                 .unwrap_or((&hier_part[2..], ""));
 
             let (user_info, host) = match authority.split_once('@') {
-                Some((u, h)) => (Some(u.to_owned()), h),
+                Some((u, h)) => {
+                    println!("User Info: {}", u);
+                    (Some(UserInfo::new(u.to_owned())?), h)
+                }
                 None => (None, authority),
             };
 
@@ -93,7 +98,7 @@ impl std::convert::TryFrom<&str> for Uri {
             };
 
             let path = AbEmpty::new((*path).to_string())?;
-
+            let host = Host::new(host)?;
             HierPart::AbEmpty(
                 Authority {
                     user_info: user_info,
@@ -119,6 +124,10 @@ impl std::convert::TryFrom<&str> for Uri {
                 (&remain[1..], "")
             };
 
+            if !FQ_RE.is_match(qs) {
+                Err("query containing illegal characters")?;
+            }
+
             let mut query = Query::new();
             for x in qs.split('&') {
                 match x.split_once('=') {
@@ -135,7 +144,7 @@ impl std::convert::TryFrom<&str> for Uri {
                 scheme: scheme,
                 hier_part: hier_part,
                 query: query,
-                fragment: Some(remain[1..].to_string()),
+                fragment: Some(Fragment::new(remain[1..].to_string())?),
             })
         } else {
             Ok(Uri {
@@ -195,7 +204,7 @@ enum HierPart {
 
 #[derive(Debug)]
 struct Authority {
-    user_info: Option<String>,
+    user_info: Option<UserInfo>,
     host: Host,
     port: Option<NonZeroU32>,
 }
@@ -208,25 +217,96 @@ enum Path {
     AbEmpty(AbEmpty),
 }
 
+static FQ_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^
+        ([a-zA-Z0-9-._~!$&'()*+,;=:@/?]|%[0-9a-fA-F])*
+    $",
+    )
+    .unwrap()
+});
+
+bound!(Fragment: String where |s| FQ_RE.is_match(s));
+
+static HOST_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^(
+        # IP-Literal
+        (
+            \[
+            #IPv6address
+            [0-9a-fA-F:.]+
+            \]
+        )|
+        # IPv4address is a subset of reg-name, so we omit it.
+        # reg-name
+        ([a-zA-Z0-9-._~]|%[0-9a-fA-F]|[!$&'()*+,;=])*
+    )$",
+    )
+    .unwrap()
+});
+
+bound!(Host: String where |s| HOST_RE.is_match(s));
+
+static USER_INFO_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([a-zA-Z0-9-._~]|%[0-9a-fA-F]|[!$&'()*+,;=]|:)+$").unwrap());
+
+bound!(UserInfo: String where |s| USER_INFO_RE.is_match(s));
+
 static SCHEME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z][a-zA-Z0-9+-.]*$").unwrap());
 
 bound!(Scheme: String where |s| SCHEME_RE.is_match(s));
 
-bound!(Rootless: String where |s| {
-    !s.split_once('/').unwrap_or((&s, "")).0.is_empty()
+static ROOTLESS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^
+        ([a-zA-Z0-9-._~!$&'()*+,;=:@]|%[0-9a-fA-F])
+        ([a-zA-Z0-9-._~!$&'()*+,;=:@/]|%[0-9a-fA-F])*
+    $",
+    )
+    .unwrap()
 });
 
-bound!(NoScheme: String where |s| {
-    !s.split_once('/').unwrap_or((&s, "")).0.contains(':')
+bound!(Rootless: String where |s| ROOTLESS_RE.is_match(s));
+
+static NOSCHEME_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^
+        ([a-zA-Z0-9-._~!$&'()*+,;=@]|%[0-9a-fA-F])
+        (/([a-zA-Z0-9-._~!$&'()*+,;=:@/]|%[0-9a-fA-F])*)?
+    $",
+    )
+    .unwrap()
 });
 
-bound!(Absolute: String where |s| {
-    s.starts_with('/') && !s.starts_with("//")
+bound!(NoScheme: String where |s| NOSCHEME_RE.is_match(s));
+
+static ABSOLUTE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^
+        / (
+            ([a-zA-Z0-9-._~!$&'()*+,;=:@]|%[0-9a-fA-F])
+            ([a-zA-Z0-9-._~!$&'()*+,;=:@/]|%[0-9a-fA-F])*
+        )?
+    $",
+    )
+    .unwrap()
 });
 
-bound!(AbEmpty: String where |s| {
-    s.is_empty() || s.starts_with('/')
+bound!(Absolute: String where |s| ABSOLUTE_RE.is_match(s));
+
+static ABEMPTY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?x)^
+        (
+           / ( [a-zA-Z0-9-._~!$&'()*+,;=:@/] | % [0-9a-fA-F] )*
+        )?
+    $",
+    )
+    .unwrap()
 });
+
+bound!(AbEmpty: String where |s| ABEMPTY_RE.is_match(s));
 
 impl std::string::ToString for Path {
     fn to_string(&self) -> String {
@@ -294,5 +374,3 @@ impl std::string::ToString for Query {
         vs.iter().fold(String::new(), |a, x| a + "&" + x)[1..].to_string()
     }
 }
-
-type Host = String;

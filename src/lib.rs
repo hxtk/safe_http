@@ -4,6 +4,7 @@
 #![feature(mutex_unpoison)]
 
 mod ep;
+mod headers;
 mod uri;
 
 #[cfg(test)]
@@ -28,6 +29,7 @@ use rayon::iter::ParallelIterator;
 use rayon::ThreadPoolBuilder;
 
 use ep::Epoll;
+use headers::Headers;
 
 #[derive(Debug)]
 pub enum Method {
@@ -58,173 +60,6 @@ impl std::convert::From<&str> for Method {
     }
 }
 
-pub struct Headers {
-    hs: HashMap<String, Vec<String>>,
-}
-
-impl Headers {
-    fn new() -> Headers {
-        Headers { hs: HashMap::new() }
-    }
-
-    fn insert(&mut self, key: &str, value: &str) {
-        let key = normalize_header_field(key);
-        let value = normalize_header_value(value);
-        match self.hs.get_mut(&key) {
-            Some(v) => v.push(value),
-            None => {
-                self.hs.insert(key, vec![value]);
-            }
-        }
-    }
-
-    fn set(&mut self, key: &str, value: &str) {
-        let key = normalize_header_field(key);
-        let value = normalize_header_value(value);
-        match self.hs.get_mut(&key) {
-            Some(v) => {
-                v.clear();
-                v.push(value);
-            }
-            None => {
-                self.hs.insert(key, vec![value]);
-            }
-        }
-    }
-
-    fn exists(&self, key: &str) -> bool {
-        self.hs.get(key).is_some()
-    }
-
-    fn get(&self, key: &str) -> Option<&str> {
-        if let Some(v) = self.hs.get(key) {
-            match v.get(0) {
-                Some(x) => Some(&x),
-                None => None,
-            }
-        } else {
-            None
-        }
-    }
-
-    fn get_vec(&self, key: &str) -> Option<&Vec<String>> {
-        if let Some(v) = self.hs.get(key) {
-            Some(&v)
-        } else {
-            None
-        }
-    }
-}
-
-static GENERAL_HDRS: [&str; 9] = [
-    "Cache-Control",
-    "Connection",
-    "Date",
-    "Pragma",
-    "Trailer",
-    "Transfer-Encoding",
-    "Upgrade",
-    "Via",
-    "Warning",
-];
-
-static REQUEST_HDRS: [&str; 19] = [
-    "Accept",
-    "Accept-Charset",
-    "Accept-Encoding",
-    "Accept-Language",
-    "Authorization",
-    "Expect",
-    "From",
-    "Host",
-    "If-Match",
-    "If-Modified-Since",
-    "If-None-Match",
-    "If-Range",
-    "If-Unmodified-Since",
-    "Max-Forwards",
-    "Proxy-Authorization",
-    "Range",
-    "Referer",
-    "TE",
-    "User-Agent",
-];
-
-static ENTITY_HDRS: [&str; 9] = [
-    "Allow",
-    "Content-Encoding",
-    "Content-Language",
-    "Content-Length",
-    "Content-MD5",
-    "Content-Range",
-    "Content-Type",
-    "Expires",
-    "Last-Modified",
-];
-
-impl std::convert::Into<Vec<u8>> for Headers {
-    fn into(mut self) -> Vec<u8> {
-        let mut res = String::new();
-        for k in GENERAL_HDRS {
-            if let Some(v) = self.hs.remove(k) {
-                v.iter().for_each(|x| {
-                    res.push_str(&k);
-                    res.push_str(": ");
-                    res.push_str(x);
-                    res.push_str("\r\n");
-                });
-            }
-        }
-        for k in REQUEST_HDRS {
-            if let Some(v) = self.hs.remove(k) {
-                v.iter().for_each(|x| {
-                    res.push_str(&k);
-                    res.push_str(": ");
-                    res.push_str(x);
-                    res.push_str("\r\n");
-                });
-            }
-        }
-        for k in ENTITY_HDRS {
-            if let Some(v) = self.hs.remove(k) {
-                v.iter().for_each(|x| {
-                    res.push_str(&k);
-                    res.push_str(": ");
-                    res.push_str(x);
-                    res.push_str("\r\n");
-                });
-            }
-        }
-        for (k, v) in self.hs {
-            v.iter().for_each(|x| {
-                res.push_str(&k);
-                res.push_str(": ");
-                res.push_str(x);
-                res.push_str("\r\n");
-            });
-        }
-
-        res.into_bytes()
-    }
-}
-
-fn normalize_header_field(s: &str) -> String {
-    s.split('-')
-        .map(|x| {
-            let (a, b) = x.split_at(1);
-            a.to_uppercase() + &b.to_lowercase()
-        })
-        .fold(String::new(), |acc, x| acc + "-" + &x)[1..]
-        .to_string()
-}
-
-fn normalize_header_value(s: &str) -> String {
-    s.split_ascii_whitespace()
-        .fold(String::new(), |acc, x| acc + " " + x)
-        .trim()
-        .to_string()
-}
-
 pub struct Request {
     //pub uri: Uri,
     pub headers: Headers,
@@ -235,6 +70,16 @@ pub struct Response {}
 
 pub trait Handler {
     fn serve_http(&self, r: Request) -> Response;
+}
+
+pub trait Server {
+    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>>;
+
+    fn listen_and_serve(&self, s: &str) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(s)?;
+        self.serve(listener)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -273,14 +118,10 @@ impl<T: Handler + Send + Sync> TPCServer<T> {
             max_header_bytes: 1 << 20,
         }
     }
+}
 
-    pub fn listen_and_serve(&self, s: &str) -> Result<(), Box<dyn Error>> {
-        let listener = TcpListener::bind(s)?;
-        self.serve(listener)?;
-        Ok(())
-    }
-
-    pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+impl<T: Handler + Send + Sync> Server for TPCServer<T> {
+    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
         let mut backoff = Duration::from_millis(0);
         thread::scope(|s| {
             for stream in l.incoming() {
@@ -306,7 +147,7 @@ impl<T: Handler + Send + Sync> TPCServer<T> {
                             _ => {
                                 break;
                             },
-                        }
+                        };
                         match read_request(&mut br, self.max_header_bytes) {
                             Ok(req) => {
                         w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!").unwrap();
@@ -340,14 +181,10 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
             concurrency: 32,
         }
     }
+}
 
-    pub fn listen_and_serve(&self, s: &str) -> Result<(), Box<dyn Error>> {
-        let listener = TcpListener::bind(s)?;
-        self.serve(listener)?;
-        Ok(())
-    }
-
-    pub fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
+impl<T: Handler + Send + Sync> Server for PollingServer<T> {
+    fn serve(&self, l: TcpListener) -> Result<(), Box<dyn Error>> {
         let lock = Arc::new(Mutex::new(()));
         let epfd = Arc::new(Epoll::new(false)?);
         let backoff = Arc::new(AtomicU64::new(0));
@@ -358,10 +195,12 @@ impl<T: Handler + Send + Sync> PollingServer<T> {
                 let epfd = Arc::clone(&epfd);
                 let backoff = Arc::clone(&backoff);
                 let header_bytes = self.max_header_bytes;
-                s.spawn(move || {
-                    server_loop(lock, epfd, backoff, header_bytes);
-                    println!("{:?} exited.", thread::current().id());
-                });
+                s.spawn(
+                    move || match server_loop(lock, epfd, backoff, header_bytes) {
+                        Ok(_) => println!("{:?} exited silently.", thread::current().id()),
+                        Err(e) => println!("{:?} errored: {}.", thread::current().id(), e),
+                    },
+                );
             }
         });
         Ok(())
@@ -382,14 +221,9 @@ fn server_loop(
             });
 
             epfd.wait(None)
-        };
+        }?;
 
-        if let Err(e) = wait {
-            println!("Error awaiting epoll: {}.", e);
-            break;
-        }
-
-        wait?.into_par_iter().for_each(|(event, ctx)| {
+        wait.into_par_iter().for_each(|(event, ctx)| {
             let mut lock = match ctx.try_lock() {
                 Err(TryLockError::WouldBlock) => {
                     return;
@@ -403,9 +237,7 @@ fn server_loop(
                             inner
                         }
                         Context::Conn(c) => {
-                            if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
-                                println!("Error removing closed connection: {}.", e);
-                            }
+                            close(c.w.as_raw_fd(), Arc::clone(&epfd));
                             return;
                         }
                     }
@@ -457,12 +289,17 @@ fn server_loop(
                 },
                 Context::Conn(c) => {
                     if event.contains(Events::EPOLLRDHUP) {
-                        if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
-                            println!("Error removing closed connection: {}.", e);
-                        }
+                        close(c.w.as_raw_fd(), Arc::clone(&epfd));
                         return;
                     }
 
+                    match c.br.has_data_left() {
+                        Ok(true) => (),
+                        _ => {
+                            close(c.w.as_raw_fd(), Arc::clone(&epfd));
+                            return;
+                        }
+                    };
                     match read_request(&mut c.br, max_header_bytes) {
                         Ok(_req) => {
                             if let Err(e) = c.w.write(HELLO) {
@@ -473,9 +310,7 @@ fn server_loop(
                             println!("Error parsing request: {}.", e);
                             if let Err(e) = c.w.write(BAD_REQUEST) {
                                 if e.kind() == ErrorKind::BrokenPipe {
-                                    if let Err(e) = epfd.remove(Context::Ref(c.w.as_raw_fd())) {
-                                        println!("Error removing closed connection: {}.", e);
-                                    }
+                                    close(c.w.as_raw_fd(), Arc::clone(&epfd));
                                     return;
                                 }
                             }
@@ -485,7 +320,12 @@ fn server_loop(
             };
         });
     }
-    Ok(())
+}
+
+fn close(fd: RawFd, epfd: Arc<Epoll<Context<TcpStream, TcpStream>>>) {
+    if let Err(e) = epfd.remove(Context::Ref(fd)) {
+        println!("Error removing closed connection: {}.", e);
+    }
 }
 
 static HELLO: &[u8; 92] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 13\r\n\r\nHello, World!";

@@ -7,12 +7,6 @@ fn it_works() {
 }
 
 #[test]
-fn normalize_header_value_with_crlf() {
-    let got = super::normalize_header_value("Foo Bar\r\nBaz: Foo");
-    assert_eq!(got, "Foo Bar Baz: Foo");
-}
-
-#[test]
 fn read_request() {
     let req_str: &[u8] =
         b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUser-Agent: curl/7.82.0\r\nAccept: */*\r\n\r\n";

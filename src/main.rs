@@ -1,4 +1,4 @@
-use http;
+use http::{self, Server};
 
 struct EmptyHandler {}
 
@@ -9,7 +9,7 @@ impl http::Handler for EmptyHandler {
 }
 
 fn main() {
-    let res = http::PollingServer::new(EmptyHandler {}).listen_and_serve("0.0.0.0:8080");
+    let res = http::TPCServer::new(EmptyHandler {}).listen_and_serve("0.0.0.0:8080");
     match res {
         Ok(_) => {
             println!("Server exited cleanly");

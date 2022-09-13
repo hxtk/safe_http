@@ -56,14 +56,20 @@ fn parse_urn() {
 #[test]
 fn parse_file() {
     let input = "file:///home/user/foo.txt";
-    let x = Uri::try_from(input).unwrap();
-    assert_eq!(x.scheme.get(), "file");
-    assert_matches!(
-        x.hier_part,
-        HierPart::AbEmpty(auth, path) if
-            auth.user_info.is_none() &&
-            auth.host == "" &&
-            auth.port.is_none() &&
-            path.get() == "/home/user/foo.txt"
-    );
+    match Uri::try_from(input) {
+        Ok(x) => {
+            assert_eq!(x.scheme.get(), "file");
+            assert_matches!(
+                x.hier_part,
+                HierPart::AbEmpty(auth, path) if
+                    auth.user_info.is_none() &&
+                    auth.host.get() == "" &&
+                    auth.port.is_none() &&
+                    path.get() == "/home/user/foo.txt"
+            );
+        }
+        Err(e) => {
+            panic!("Error parsing URI: {}.", e);
+        }
+    };
 }
